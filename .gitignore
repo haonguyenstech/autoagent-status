@@ -1,0 +1,13 @@
+# Secrets — NEVER commit
+.update-token
+.gist-id
+
+# Build artifacts (build/Token.swift contains the embedded token!)
+build/
+dist/
+npm-pkg/
+AppIcon.icns
+AppIcon.iconset/
+
+# macOS
+.DS_Store
