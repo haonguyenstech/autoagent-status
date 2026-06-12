@@ -23,12 +23,17 @@ credential status at a glance, without ever opening a terminal.
 
 ## Install
 
-**Recommended — one line** (get the link from the team Slack pin; it contains a
-private download token so it is not printed here):
+**Recommended — one line.** Open Terminal and run:
 
 ```bash
-curl -fsSL <pinned-install-url> | bash
+curl -fsSL https://gist.githubusercontent.com/haonguyenstech/9376b1f1baa226c75dddfad706b40416/raw/install.sh | bash
 ```
+
+It installs the latest version, sets up the `auto-agent-ai` CLI if needed, and
+launches the app. Run it again any time to update manually.
+
+> This URL is team-internal — treat it like a password and don't post it
+> publicly (it carries a read-only download token for the private release repo).
 
 **Manual** — download the latest `AutoAgent-Status-x.y.z.zip` from
 [Releases](../../releases), unzip, then run:
