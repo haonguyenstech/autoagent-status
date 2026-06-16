@@ -1043,6 +1043,9 @@ struct ActionButton: View {
 struct ContentView: View {
     @ObservedObject var store: StatusStore
     @State private var confirmLogout = false
+    @State private var tab: Tab = .status
+
+    enum Tab: Hashable { case status, settings }
 
     private static let relFormatter = RelativeDateTimeFormatter()
     private static let absFormatter: DateFormatter = {
@@ -1058,27 +1061,15 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            VStack(spacing: 10) {
-                if store.cliUpdateRequired {
-                    updateRequiredBanner
-                }
-                if let url = store.loginURL {
-                    loginBanner(url)
-                }
-                if let err = store.lastError {
-                    errorBanner(err)
-                }
-                credentialCard
-                usageCard
-                watcherCard
-                healthCard
-                actionsSection
+            tabPicker
+            banners
+            Group {
+                if tab == .status { statusTab } else { settingsTab }
             }
-            .padding(12)
             Divider()
-            footer
+            bottomBar
         }
-        .frame(width: 330)
+        .frame(width: 340)
         .confirmationDialog(
             "Log out of AutoAgent?",
             isPresented: $confirmLogout,
@@ -1089,6 +1080,80 @@ struct ContentView: View {
         } message: {
             Text("This stops the watcher and removes the Claude Code credential from your Keychain.")
         }
+    }
+
+    private var tabPicker: some View {
+        TabSwitcher(selection: $tab, tint: s.color)
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+    }
+
+    /// Important banners stay visible on both tabs.
+    @ViewBuilder private var banners: some View {
+        if store.cliUpdateRequired || store.loginURL != nil || store.lastError != nil {
+            VStack(spacing: 8) {
+                if store.cliUpdateRequired { updateRequiredBanner }
+                if let url = store.loginURL { loginBanner(url) }
+                if let err = store.lastError { errorBanner(err) }
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+        }
+    }
+
+    private var statusTab: some View {
+        VStack(spacing: 10) {
+            credentialCard
+            usageCard
+            watcherCard
+            healthCard
+            actionsSection
+        }
+        .padding(12)
+    }
+
+    private var settingsTab: some View {
+        VStack(spacing: 4) {
+            KeepAwakeRow(store: store)
+            SettingToggle(
+                icon: "eye.fill", tint: .indigo,
+                title: "Auto-awake with watcher",
+                subtitle: "Stay awake while the watcher runs",
+                isOn: Binding(get: { store.autoAwakeWithWatcher },
+                              set: { store.setAutoAwakeWithWatcher($0) }))
+            SettingToggle(
+                icon: "arrow.triangle.2.circlepath", tint: .green,
+                title: "Auto-restart watcher",
+                subtitle: "Log back in if the watcher dies",
+                isOn: Binding(get: { store.autoRestart }, set: { store.setAutoRestart($0) }))
+            SettingToggle(
+                icon: "arrow.down.circle.fill", tint: .orange,
+                title: "Auto-update CLI",
+                subtitle: "Install new auto-agent-ai versions",
+                isOn: Binding(get: { store.autoUpdateCLI }, set: { store.setAutoUpdateCLI($0) }))
+            SettingToggle(
+                icon: "powerplug.fill", tint: .blue,
+                title: "Start at Login",
+                subtitle: "Launch automatically on sign-in",
+                isOn: Binding(get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
+        }
+        .padding(12)
+    }
+
+    /// Global controls, pinned below both tabs.
+    private var bottomBar: some View {
+        HStack(spacing: 10) {
+            footerButton("arrow.clockwise", help: "Refresh status & check for updates") {
+                store.refresh()
+                store.checkVersions(force: true)
+                store.refreshUsage(force: true)
+            }
+            footerButton("doc.text", help: "Open watch log") { store.openLog() }
+            Spacer()
+            footerButton("power", help: "Quit AutoAgent Status") { NSApp.terminate(nil) }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
     }
 
     // MARK: Header
@@ -1288,7 +1353,8 @@ struct ContentView: View {
                 Text(log)
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                     .help(log)
             }
         }
@@ -1399,49 +1465,6 @@ struct ContentView: View {
 
     // MARK: Footer
 
-    private var footer: some View {
-        VStack(spacing: 10) {
-            VStack(spacing: 3) {
-                KeepAwakeRow(store: store)
-                SettingToggle(
-                    icon: "eye.fill", tint: .indigo,
-                    title: "Auto-awake with watcher",
-                    subtitle: "Stay awake while the watcher runs",
-                    isOn: Binding(get: { store.autoAwakeWithWatcher },
-                                  set: { store.setAutoAwakeWithWatcher($0) }))
-                SettingToggle(
-                    icon: "arrow.triangle.2.circlepath", tint: .green,
-                    title: "Auto-restart watcher",
-                    subtitle: "Log back in if the watcher dies",
-                    isOn: Binding(get: { store.autoRestart }, set: { store.setAutoRestart($0) }))
-                SettingToggle(
-                    icon: "arrow.down.circle.fill", tint: .orange,
-                    title: "Auto-update CLI",
-                    subtitle: "Install new auto-agent-ai versions",
-                    isOn: Binding(get: { store.autoUpdateCLI }, set: { store.setAutoUpdateCLI($0) }))
-                SettingToggle(
-                    icon: "powerplug.fill", tint: .blue,
-                    title: "Start at Login",
-                    subtitle: "Launch automatically on sign-in",
-                    isOn: Binding(get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
-            }
-
-            HStack(spacing: 10) {
-                footerButton("arrow.clockwise", help: "Refresh status & check for updates") {
-                    store.refresh()
-                    store.checkVersions(force: true)
-                    store.refreshUsage(force: true)
-                }
-                footerButton("doc.text", help: "Open watch log") { store.openLog() }
-                Spacer()
-                footerButton("power", help: "Quit AutoAgent Status") { NSApp.terminate(nil) }
-            }
-            .padding(.horizontal, 4)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-    }
-
     private func footerButton(_ icon: String, help: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
@@ -1530,6 +1553,61 @@ struct KeepAwakeRow: View {
         }
         .buttonStyle(.plain)
         .help(label == "∞" ? "Stay awake until turned off" : "Stay awake for \(label)")
+    }
+}
+
+/// A pill-style two-tab switcher with an animated sliding highlight that
+/// adopts the current status color.
+struct TabSwitcher: View {
+    @Binding var selection: ContentView.Tab
+    var tint: Color
+    @Namespace private var ns
+
+    private let tabs: [(tab: ContentView.Tab, icon: String, label: String)] = [
+        (.status, "key.fill", "Status"),
+        (.settings, "slider.horizontal.3", "Settings"),
+    ]
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(tabs, id: \.tab) { item in
+                segment(item.tab, item.icon, item.label)
+            }
+        }
+        .padding(4)
+        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    private func segment(_ tab: ContentView.Tab, _ icon: String, _ label: String) -> some View {
+        let selected = selection == tab
+        return Button {
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) { selection = tab }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 11, weight: .semibold))
+                Text(label)
+                    .font(.callout.weight(.semibold))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 6)
+            .foregroundStyle(selected ? Color.white : Color.secondary)
+            .background {
+                if selected {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(LinearGradient(colors: [tint, tint.opacity(0.72)],
+                                             startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .shadow(color: tint.opacity(0.35), radius: 4, y: 1)
+                        .matchedGeometryEffect(id: "tabPill", in: ns)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 
