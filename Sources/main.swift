@@ -1201,52 +1201,97 @@ struct ContentView: View {
     // MARK: Footer
 
     private var footer: some View {
-        VStack(spacing: 7) {
-            HStack(spacing: 14) {
-                Toggle("Auto-restart watcher", isOn: Binding(
-                    get: { store.autoRestart },
-                    set: { store.setAutoRestart($0) }
-                ))
-                .help("If the watcher dies, automatically log in again with your last role")
-
-                Spacer()
-
-                footerButton("arrow.clockwise", help: "Refresh status & check for updates") {
-                store.refresh()
-                store.checkVersions(force: true)
-                store.refreshUsage(force: true)
+        VStack(spacing: 10) {
+            VStack(spacing: 3) {
+                SettingToggle(
+                    icon: "arrow.triangle.2.circlepath", tint: .green,
+                    title: "Auto-restart watcher",
+                    subtitle: "Log back in if the watcher dies",
+                    isOn: Binding(get: { store.autoRestart }, set: { store.setAutoRestart($0) }))
+                SettingToggle(
+                    icon: "arrow.down.circle.fill", tint: .orange,
+                    title: "Auto-update CLI",
+                    subtitle: "Install new auto-agent-ai versions",
+                    isOn: Binding(get: { store.autoUpdateCLI }, set: { store.setAutoUpdateCLI($0) }))
+                SettingToggle(
+                    icon: "powerplug.fill", tint: .blue,
+                    title: "Start at Login",
+                    subtitle: "Launch automatically on sign-in",
+                    isOn: Binding(get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
             }
+
+            HStack(spacing: 10) {
+                footerButton("arrow.clockwise", help: "Refresh status & check for updates") {
+                    store.refresh()
+                    store.checkVersions(force: true)
+                    store.refreshUsage(force: true)
+                }
                 footerButton("doc.text", help: "Open watch log") { store.openLog() }
+                Spacer()
                 footerButton("power", help: "Quit AutoAgent Status") { NSApp.terminate(nil) }
             }
-            HStack {
-                Toggle("Start at Login", isOn: Binding(
-                    get: { store.launchAtLogin },
-                    set: { store.setLaunchAtLogin($0) }
-                ))
-                Spacer()
-                Toggle("Auto-update CLI", isOn: Binding(
-                    get: { store.autoUpdateCLI },
-                    set: { store.setAutoUpdateCLI($0) }
-                ))
-                .help("Automatically install new auto-agent-ai versions when found")
-            }
+            .padding(.horizontal, 4)
         }
-        .toggleStyle(.switch)
-        .controlSize(.mini)
-        .font(.caption)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 9)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
     }
 
     private func footerButton(_ icon: String, help: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
-                .font(.system(size: 12, weight: .medium))
+                .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(.secondary)
+                .frame(width: 28, height: 24)
+                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
         }
         .buttonStyle(.plain)
         .help(help)
+    }
+}
+
+/// A polished settings row: tinted icon tile, title + subtitle, and a switch.
+struct SettingToggle: View {
+    let icon: String
+    let tint: Color
+    let title: String
+    let subtitle: String
+    @Binding var isOn: Bool
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(isOn ? Color.white : tint)
+                .frame(width: 26, height: 26)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(tint.opacity(isOn ? 0.95 : 0.16))
+                )
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.callout.weight(.medium))
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Toggle("", isOn: $isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .tint(tint)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(.quaternary.opacity(hovering ? 0.45 : 0))
+        )
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovering)
     }
 }
 
