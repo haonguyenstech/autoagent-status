@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import IOKit.pwr_mgt
 import ServiceManagement
 import SwiftUI
 import UserNotifications
@@ -249,8 +250,34 @@ struct TokenUsage {
     var output = 0
     var cacheCreate = 0
     var cacheRead = 0
+    var costUSD = 0.0
     var billable: Int { input + output + cacheCreate }
     var total: Int { billable + cacheRead }
+}
+
+/// Per-token USD pricing by model family. Rates are $/million tokens from the
+/// claude-api reference: Opus 5/25, Sonnet 3/15, Haiku 1/5 (input/output);
+/// cache write = 1.25× input, cache read = 0.1× input.
+struct ModelPricing {
+    let input, output, cacheWrite, cacheRead: Double
+}
+
+func pricing(for model: String) -> ModelPricing? {
+    func p(_ inMtok: Double, _ outMtok: Double) -> ModelPricing {
+        ModelPricing(input: inMtok / 1_000_000, output: outMtok / 1_000_000,
+                     cacheWrite: inMtok * 1.25 / 1_000_000, cacheRead: inMtok * 0.1 / 1_000_000)
+    }
+    let m = model.lowercased()
+    if m.contains("opus") { return p(5, 25) }
+    if m.contains("sonnet") { return p(3, 15) }
+    if m.contains("haiku") { return p(1, 5) }
+    return nil
+}
+
+func formatUSD(_ v: Double) -> String {
+    if v >= 1 { return String(format: "$%.2f", v) }
+    if v > 0 { return String(format: "$%.3f", v) }
+    return "$0.00"
 }
 
 func formatTokens(_ n: Int) -> String {
@@ -308,10 +335,15 @@ func readTokenUsage() -> TokenUsage {
                     if seen.contains(key) { continue }
                     seen.insert(key)
                 }
-                u.input += usage["input_tokens"] as? Int ?? 0
-                u.output += usage["output_tokens"] as? Int ?? 0
-                u.cacheCreate += usage["cache_creation_input_tokens"] as? Int ?? 0
-                u.cacheRead += usage["cache_read_input_tokens"] as? Int ?? 0
+                let inp = usage["input_tokens"] as? Int ?? 0
+                let out = usage["output_tokens"] as? Int ?? 0
+                let cc = usage["cache_creation_input_tokens"] as? Int ?? 0
+                let cr = usage["cache_read_input_tokens"] as? Int ?? 0
+                u.input += inp; u.output += out; u.cacheCreate += cc; u.cacheRead += cr
+                if let model = msg["model"] as? String, let pr = pricing(for: model) {
+                    u.costUSD += Double(inp) * pr.input + Double(out) * pr.output
+                        + Double(cc) * pr.cacheWrite + Double(cr) * pr.cacheRead
+                }
             }
         }
     }
@@ -444,6 +476,37 @@ func readStatus() -> AgentStatus {
     return s
 }
 
+// MARK: - Keep-awake (IOKit power assertion — prevents idle system sleep)
+
+/// Holds a `PreventUserIdleSystemSleep` assertion so the Mac won't fall asleep.
+/// The display may still dim/sleep; the system stays running. Released
+/// automatically by the OS when the process exits.
+final class SleepGuard {
+    private var assertionID = IOPMAssertionID(0)
+    private(set) var active = false
+
+    func start(reason: String) {
+        guard !active else { return }
+        var id = IOPMAssertionID(0)
+        let result = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            reason as CFString,
+            &id)
+        if result == kIOReturnSuccess {
+            assertionID = id
+            active = true
+        }
+    }
+
+    func stop() {
+        guard active else { return }
+        IOPMAssertionRelease(assertionID)
+        assertionID = IOPMAssertionID(0)
+        active = false
+    }
+}
+
 // MARK: - Store
 
 final class StatusStore: ObservableObject {
@@ -465,6 +528,18 @@ final class StatusStore: ObservableObject {
     /// Microsoft sign-in URL while an interactive login is waiting on the browser.
     @Published var loginURL: String?
 
+    // Keep-awake: prevent the Mac from sleeping for a chosen duration.
+    @Published var keepAwake = false
+    @Published var keepAwakeHours = UserDefaults.standard.object(forKey: "keepAwakeHours") as? Int ?? 2
+    @Published var keepAwakeUntil: Date?
+    /// Keep the Mac awake automatically whenever the watcher is running.
+    @Published var autoAwakeWithWatcher = UserDefaults.standard.bool(forKey: "autoAwakeWithWatcher")
+    /// Selectable durations (hours); 0 means "until I turn it off".
+    let keepAwakeOptions = [2, 4, 6, 8, 10, 12]
+
+    /// The Mac is being held awake — manually, or automatically while the watcher runs.
+    var isStayingAwake: Bool { keepAwake || (autoAwakeWithWatcher && status.watcherRunning) }
+
     private let workQueue = DispatchQueue(label: "auto-agent-status.work")
     private let usageQueue = DispatchQueue(label: "auto-agent-status.usage", qos: .utility)
     private var lastVersionCheck = Date.distantPast
@@ -472,6 +547,14 @@ final class StatusStore: ObservableObject {
     private var hasStatus = false
     private var lastUserAction = Date.distantPast
     private var lastAutoRestartAt = Date.distantPast
+
+    private let sleepGuard = SleepGuard()
+    private var keepAwakeTimer: DispatchWorkItem?
+
+    // Token-expiry warnings: notify once per threshold (minutes) per credential.
+    private let expiryThresholds = [30, 15, 5]
+    private var firedExpiryWarnings = Set<Int>()
+    private var lastExpirySeen: Date?
 
     /// Last role we logged in with — survives the CLI wiping state.json,
     /// so auto-restart knows what to log back in as.
@@ -481,6 +564,99 @@ final class StatusStore: ObservableObject {
     }
 
     @Published var cliPath: String?
+
+    init() {
+        // Restore keep-awake across relaunches (notably the app's own self-update).
+        defer { syncSleepGuard() }
+        guard UserDefaults.standard.bool(forKey: "keepAwake") else { return }
+        if keepAwakeHours == 0 {
+            keepAwake = true
+        } else if let until = UserDefaults.standard.object(forKey: "keepAwakeUntil") as? Date,
+                  until > Date() {
+            keepAwake = true
+            keepAwakeUntil = until
+            scheduleKeepAwakeExpiry(at: until)
+        } else {
+            UserDefaults.standard.set(false, forKey: "keepAwake")
+        }
+    }
+
+    /// Drive the power assertion from the combined desired state (manual + auto).
+    private func syncSleepGuard() {
+        if isStayingAwake {
+            sleepGuard.start(reason: "AutoAgent: keep Mac awake")
+        } else {
+            sleepGuard.stop()
+        }
+    }
+
+    func setAutoAwakeWithWatcher(_ on: Bool) {
+        autoAwakeWithWatcher = on
+        UserDefaults.standard.set(on, forKey: "autoAwakeWithWatcher")
+        syncSleepGuard()
+    }
+
+    /// Remaining keep-awake time as "1h 05m" / "12m", or nil if off/indefinite.
+    var keepAwakeRemaining: String? {
+        guard let until = keepAwakeUntil else { return nil }
+        let secs = Int(until.timeIntervalSinceNow)
+        guard secs > 0 else { return nil }
+        let h = secs / 3600, m = (secs % 3600) / 60
+        return h > 0 ? "\(h)h \(String(format: "%02d", m))m" : "\(m)m"
+    }
+
+    func setKeepAwake(_ on: Bool) {
+        keepAwake = on
+        UserDefaults.standard.set(on, forKey: "keepAwake")
+        if on {
+            armKeepAwakeExpiry()
+        } else {
+            keepAwakeTimer?.cancel(); keepAwakeTimer = nil
+            keepAwakeUntil = nil
+            UserDefaults.standard.removeObject(forKey: "keepAwakeUntil")
+        }
+        syncSleepGuard()
+    }
+
+    /// Tap a duration chip: remember it, and start keep-awake right away
+    /// (or restart the countdown if it's already on).
+    func pickKeepAwake(hours: Int) {
+        keepAwakeHours = hours
+        UserDefaults.standard.set(hours, forKey: "keepAwakeHours")
+        if keepAwake {
+            armKeepAwakeExpiry() // restart the countdown with the new duration
+        } else {
+            setKeepAwake(true)   // one-tap start with the chosen duration
+        }
+    }
+
+    private func armKeepAwakeExpiry() {
+        keepAwakeTimer?.cancel(); keepAwakeTimer = nil
+        guard keepAwakeHours > 0 else { // 0 = indefinite, until toggled off
+            keepAwakeUntil = nil
+            UserDefaults.standard.removeObject(forKey: "keepAwakeUntil")
+            return
+        }
+        let until = Date().addingTimeInterval(Double(keepAwakeHours) * 3600)
+        keepAwakeUntil = until
+        UserDefaults.standard.set(until, forKey: "keepAwakeUntil")
+        scheduleKeepAwakeExpiry(at: until)
+    }
+
+    private func scheduleKeepAwakeExpiry(at date: Date) {
+        keepAwakeTimer?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.keepAwake = false
+            self.keepAwakeUntil = nil
+            UserDefaults.standard.set(false, forKey: "keepAwake")
+            UserDefaults.standard.removeObject(forKey: "keepAwakeUntil")
+            self.syncSleepGuard()
+            notify("Sleep re-enabled", "Keep-awake finished — your Mac can sleep normally again.")
+        }
+        keepAwakeTimer = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(1, date.timeIntervalSinceNow), execute: item)
+    }
 
     func refresh() {
         workQueue.async {
@@ -580,7 +756,27 @@ final class StatusStore: ObservableObject {
         hasStatus = true
         if let role = new.role { savedRole = role }
         if let old { notifyTransitions(old: old, new: new) }
+        checkExpiryWarnings(new)
+        syncSleepGuard() // watcher may have started/stopped → auto-awake follows
         maybeAutoRestart(new)
+    }
+
+    /// Warn once at each threshold (30/15/5 min) before the credential expires.
+    private func checkExpiryWarnings(_ s: AgentStatus) {
+        guard let exp = s.expiresAt else {
+            firedExpiryWarnings.removeAll(); lastExpirySeen = nil; return
+        }
+        if exp != lastExpirySeen { // new credential / renewed token → fresh cycle
+            firedExpiryWarnings.removeAll()
+            lastExpirySeen = exp
+        }
+        guard exp > Date() else { return } // already expired — handled by notifyTransitions
+        let minsLeft = exp.timeIntervalSinceNow / 60
+        let crossed = expiryThresholds.filter { Double($0) >= minsLeft }
+        guard let warn = crossed.min(), !firedExpiryWarnings.contains(warn) else { return }
+        firedExpiryWarnings.formUnion(crossed)
+        let tail = s.watcherRunning ? " The watcher will try to renew it." : ""
+        notify("Token expiring soon", "Your Claude Code token expires in about \(warn) min.\(tail)")
     }
 
     private func notifyTransitions(old: AgentStatus, new: AgentStatus) {
@@ -1018,6 +1214,9 @@ struct ContentView: View {
                 InfoRow(icon: "sum", label: "Token usage", value: formatTokens(u.billable),
                         valueColor: .blue,
                         help: "Billable = input + output + cache create (\(u.billable) tokens)")
+                InfoRow(icon: "dollarsign.circle", label: "Est. cost", value: formatUSD(u.costUSD),
+                        valueColor: .green,
+                        help: "Estimated API cost for today's tokens, priced per model (Opus/Sonnet/Haiku). Approximate.")
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 6) {
                     usageCell("Input", u.input, icon: "arrow.down", color: .teal)
                     usageCell("Output", u.output, icon: "arrow.up", color: .blue)
@@ -1203,6 +1402,13 @@ struct ContentView: View {
     private var footer: some View {
         VStack(spacing: 10) {
             VStack(spacing: 3) {
+                KeepAwakeRow(store: store)
+                SettingToggle(
+                    icon: "eye.fill", tint: .indigo,
+                    title: "Auto-awake with watcher",
+                    subtitle: "Stay awake while the watcher runs",
+                    isOn: Binding(get: { store.autoAwakeWithWatcher },
+                                  set: { store.setAutoAwakeWithWatcher($0) }))
                 SettingToggle(
                     icon: "arrow.triangle.2.circlepath", tint: .green,
                     title: "Auto-restart watcher",
@@ -1246,6 +1452,84 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .help(help)
+    }
+}
+
+/// Keep-awake settings row: icon, title + live countdown, a switch, and a
+/// row of one-tap duration chips (2h / 4h / … / ∞) that start it immediately.
+struct KeepAwakeRow: View {
+    @ObservedObject var store: StatusStore
+    private let tint = Color.purple
+
+    private var subtitle: String {
+        if store.keepAwake {
+            if let left = store.keepAwakeRemaining { return "Awake · \(left) left" }
+            return "Awake · until you turn it off"
+        }
+        return "Tap a time to keep your Mac awake"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 10) {
+                Image(systemName: store.keepAwake ? "cup.and.saucer.fill" : "cup.and.saucer")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(store.keepAwake ? Color.white : tint)
+                    .frame(width: 26, height: 26)
+                    .background(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(tint.opacity(store.keepAwake ? 0.95 : 0.16))
+                    )
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Keep Mac awake")
+                        .font(.callout.weight(.medium))
+                    Text(subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(store.keepAwake ? tint : .secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                Toggle("", isOn: Binding(get: { store.keepAwake }, set: { store.setKeepAwake($0) }))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .tint(tint)
+            }
+
+            // One-tap duration chips — big, obvious targets.
+            HStack(spacing: 5) {
+                ForEach(store.keepAwakeOptions, id: \.self) { h in
+                    chip(label: "\(h)h", selected: store.keepAwake && store.keepAwakeHours == h) {
+                        store.pickKeepAwake(hours: h)
+                    }
+                }
+                chip(label: "∞", selected: store.keepAwake && store.keepAwakeHours == 0) {
+                    store.pickKeepAwake(hours: 0)
+                }
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(tint.opacity(store.keepAwake ? 0.06 : 0))
+        )
+    }
+
+    private func chip(label: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.caption.weight(.semibold).monospacedDigit())
+                .foregroundStyle(selected ? Color.white : tint)
+                .frame(maxWidth: .infinity, minHeight: 24)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(tint.opacity(selected ? 1.0 : 0.13))
+                )
+                .contentShape(RoundedRectangle(cornerRadius: 7))
+        }
+        .buttonStyle(.plain)
+        .help(label == "∞" ? "Stay awake until turned off" : "Stay awake for \(label)")
     }
 }
 
@@ -1320,7 +1604,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         center.delegate = self
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
 
-        store.$status.combineLatest(store.$busy)
+        store.$status.combineLatest(store.$busy, store.$keepAwake, store.$autoAwakeWithWatcher)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.updateIcon() }
             .store(in: &bag)
@@ -1351,12 +1635,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 title = h > 0 ? " \(h)h \(m)m" : " \(m)m"
             }
         }
+        // Coffee marker while the Mac is held awake (manual or auto-with-watcher).
+        if store.busy == nil && store.isStayingAwake { title += " ☕" }
         button.attributedTitle = NSAttributedString(
             string: title,
             attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium)])
         button.imagePosition = title.isEmpty ? .imageOnly : .imageLeft
         if button.image == nil { button.title = "AA" }
-        button.toolTip = "AutoAgent — \(desc)"
+        let awakeNote = store.isStayingAwake ? " · keeping Mac awake" : ""
+        button.toolTip = "AutoAgent — \(desc)\(awakeNote)"
     }
 
     @objc private func togglePopover() {
