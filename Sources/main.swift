@@ -36,8 +36,12 @@ struct CommandResult {
     let output: String
 }
 
+/// `onOutput` is called on a background queue with the full accumulated output
+/// each time a chunk arrives; return `true` from it to abort the process early
+/// (used to bail out of an interactive sign-in we can't complete unattended).
 @discardableResult
-func runCommand(_ path: String, _ args: [String], timeout: TimeInterval = 30) -> CommandResult {
+func runCommand(_ path: String, _ args: [String], timeout: TimeInterval = 30,
+                onOutput: ((String) -> Bool)? = nil) -> CommandResult {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: path)
     proc.arguments = args
@@ -57,10 +61,18 @@ func runCommand(_ path: String, _ args: [String], timeout: TimeInterval = 30) ->
 
     var data = Data()
     let lock = NSLock()
+    var aborted = false
     pipe.fileHandleForReading.readabilityHandler = { handle in
         let chunk = handle.availableData
         if !chunk.isEmpty {
-            lock.lock(); data.append(chunk); lock.unlock()
+            lock.lock()
+            data.append(chunk)
+            let snapshot = String(data: data, encoding: .utf8) ?? ""
+            lock.unlock()
+            if let onOutput, !aborted, onOutput(snapshot) {
+                aborted = true
+                proc.terminate()
+            }
         }
     }
 
@@ -91,6 +103,31 @@ func runCommand(_ path: String, _ args: [String], timeout: TimeInterval = 30) ->
 
 func stripANSI(_ s: String) -> String {
     s.replacingOccurrences(of: "\u{1B}\\[[0-9;]*[A-Za-z]", with: "", options: .regularExpression)
+}
+
+/// The CLI hard-blocks with an "Update required" box when the installed
+/// version is below the server's minimum — it exits non-zero and refuses to
+/// run (login/push/logout/watcher) until it's npm-updated. Detect that so we
+/// can prompt (or auto-update) instead of dumping the raw box as a failure.
+func isUpdateRequired(_ output: String) -> Bool {
+    let s = stripANSI(output).lowercased()
+    return s.contains("update required")
+        || s.contains("required update")
+        || s.contains("can no longer be used")
+}
+
+/// `login` now does interactive Microsoft OAuth: it prints a sign-in URL and
+/// waits for the browser callback. Pull that URL out of the CLI's output so we
+/// can re-open it / show it as a fallback (the CLI tries to open it itself).
+func extractLoginURL(_ output: String) -> String? {
+    let clean = stripANSI(output)
+    guard let re = try? NSRegularExpression(pattern: "https?://[^\\s\"'`)]+") else { return nil }
+    let ns = clean as NSString
+    let urls = re.matches(in: clean, range: NSRange(location: 0, length: ns.length))
+        .map { ns.substring(with: $0.range).trimmingCharacters(in: CharacterSet(charactersIn: ".,")) }
+    // Prefer the CLI auth redirect (has cli_redirect/cli_state) over any other link.
+    return urls.first { $0.contains("cli_redirect") || $0.contains("cli_state") }
+        ?? urls.first { $0.contains("/login") }
 }
 
 let defaultServer = "https://vibe.saigontechnology.vn"
@@ -423,6 +460,10 @@ final class StatusStore: ObservableObject {
     @Published var appLatestVersion: String?
     @Published var appDownloadURL: String?
     @Published var updatingApp = false
+    /// CLI returned the "Update required" hard-block — it can't run until updated.
+    @Published var cliUpdateRequired = false
+    /// Microsoft sign-in URL while an interactive login is waiting on the browser.
+    @Published var loginURL: String?
 
     private let workQueue = DispatchQueue(label: "auto-agent-status.work")
     private let usageQueue = DispatchQueue(label: "auto-agent-status.usage", qos: .utility)
@@ -509,7 +550,7 @@ final class StatusStore: ObservableObject {
         }
     }
 
-    func updateCLI() {
+    func updateCLI(then completion: (() -> Void)? = nil) {
         guard !updatingCLI else { return }
         guard let npm = npmPath else {
             lastError = "npm not found in /opt/homebrew/bin or /usr/local/bin"
@@ -524,7 +565,9 @@ final class StatusStore: ObservableObject {
                 if r.code != 0 {
                     self.lastError = "CLI update failed:\n" + String(stripANSI(r.output).suffix(400))
                 } else {
+                    self.cliUpdateRequired = false
                     notify("CLI updated", "auto-agent-ai was updated successfully.")
+                    completion?()
                 }
                 self.checkVersions(force: true)
             }
@@ -574,7 +617,7 @@ final class StatusStore: ObservableObject {
 
     func login(role: String) {
         savedRole = role
-        runCLI("login (\(role))", ["login", "--role", role])
+        runCLI("login (\(role))", ["login", "--role", role], interactive: true)
     }
     func push() { runCLI("push", ["push"]) }
     func logout() {
@@ -582,7 +625,8 @@ final class StatusStore: ObservableObject {
         runCLI("logout", ["logout"])
     }
 
-    private func runCLI(_ name: String, _ args: [String], isAutoRestart: Bool = false) {
+    private func runCLI(_ name: String, _ args: [String],
+                        isAutoRestart: Bool = false, isRetry: Bool = false, interactive: Bool = false) {
         guard busy == nil else { return }
         guard let cli = cliPath ?? findCLI() else {
             lastError = "auto-agent-ai CLI not found. Install it: npm install -g \(cliPackage)"
@@ -590,19 +634,64 @@ final class StatusStore: ObservableObject {
         }
         busy = name
         lastError = nil
+        loginURL = nil
         lastUserAction = Date()
+        // Interactive sign-in waits on the browser callback, so give it room.
+        let timeout: TimeInterval = interactive ? 180 : 90
         workQueue.async {
-            let result = runCommand(cli, args, timeout: 90)
+            var sawURL = false
+            var abortedForAuth = false
+            let result = runCommand(cli, args, timeout: timeout) { text in
+                // Only logins surface a sign-in URL; ignore everything else.
+                guard interactive || isAutoRestart, !sawURL, let url = extractLoginURL(text) else { return false }
+                sawURL = true
+                if isAutoRestart {
+                    // Can't complete an interactive sign-in unattended — bail and ask the user.
+                    abortedForAuth = true
+                    DispatchQueue.main.async {
+                        notify("Sign-in required",
+                               "The watcher needs you to sign in again — open AutoAgent and click Owner or Client Login.")
+                    }
+                    return true // abort the hung process
+                }
+                DispatchQueue.main.async {
+                    self.loginURL = url
+                    notify("Finish signing in",
+                           "Complete the Microsoft sign-in in your browser to finish logging in.")
+                }
+                return false // keep waiting for the browser callback
+            }
             let fresh = readStatus()
             DispatchQueue.main.async {
                 self.busy = nil
+                self.loginURL = nil
                 self.lastUserAction = Date()
                 self.apply(fresh)
+                if abortedForAuth { return } // user was already notified; no error banner
                 if result.code != 0 {
+                    if isUpdateRequired(result.output) {
+                        self.cliUpdateRequired = true
+                        // Auto-update once, then retry the original command.
+                        if self.autoUpdateCLI, !isRetry, !self.updatingCLI {
+                            notify("CLI update required",
+                                   "auto-agent-ai must be updated before it can run — updating now…")
+                            self.updateCLI {
+                                self.runCLI(name, args, isAutoRestart: isAutoRestart,
+                                            isRetry: true, interactive: interactive)
+                            }
+                        } else {
+                            self.lastError = "auto-agent-ai requires an update before it can run. "
+                                + "Click \u{201C}Update CLI now\u{201D} above."
+                        }
+                        return
+                    }
                     self.lastError = "\(name) failed (exit \(result.code)):\n"
                         + String(stripANSI(result.output).suffix(400))
-                } else if isAutoRestart {
-                    notify("Watcher restarted", "Watcher was down — logged in again automatically.")
+                } else {
+                    self.cliUpdateRequired = false
+                    if isAutoRestart {
+                        notify("Watcher restarted", "Watcher was down — logged in again automatically.")
+                    }
                 }
                 // login spawns a detached watcher that writes state shortly after
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.refresh() }
@@ -774,6 +863,12 @@ struct ContentView: View {
         VStack(spacing: 0) {
             header
             VStack(spacing: 10) {
+                if store.cliUpdateRequired {
+                    updateRequiredBanner
+                }
+                if let url = store.loginURL {
+                    loginBanner(url)
+                }
                 if let err = store.lastError {
                     errorBanner(err)
                 }
@@ -1015,17 +1110,69 @@ struct ContentView: View {
                 .padding(.vertical, 14)
             } else {
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
-                    ActionButton(title: "Owner Login", icon: "crown.fill", color: .blue,
-                                 disabled: store.cliPath == nil) { store.login(role: "owner") }
                     ActionButton(title: "Client Login", icon: "person.fill", color: .teal,
                                  disabled: store.cliPath == nil) { store.login(role: "client") }
-                    ActionButton(title: "Push Now", icon: "arrow.up.circle.fill", color: .purple,
-                                 disabled: store.cliPath == nil) { store.push() }
                     ActionButton(title: "Logout", icon: "rectangle.portrait.and.arrow.right", color: .red,
                                  disabled: store.cliPath == nil) { confirmLogout = true }
                 }
             }
         }
+    }
+
+    private var updateRequiredBanner: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text("CLI update required")
+                    .font(.callout.weight(.semibold))
+            }
+            Text("auto-agent-ai is blocked until it's updated — login, push and the watcher won't work until you update.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if store.updatingCLI {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text("Updating CLI…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                ActionButton(title: "Update CLI now", icon: "arrow.down.circle.fill",
+                             color: .orange) { store.updateCLI() }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func loginBanner(_ url: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "person.badge.shield.checkmark.fill")
+                    .foregroundStyle(.blue)
+                Text("Finish signing in")
+                    .font(.callout.weight(.semibold))
+            }
+            Text("Complete the Microsoft sign-in in your browser. If it didn't open, use the button below.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                ActionButton(title: "Open sign-in page", icon: "safari.fill", color: .blue) {
+                    if let u = URL(string: url) { NSWorkspace.shared.open(u) }
+                }
+                ActionButton(title: "Copy link", icon: "doc.on.doc.fill", color: .gray) {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(url, forType: .string)
+                }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.blue.opacity(0.1), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     private func errorBanner(_ message: String) -> some View {
