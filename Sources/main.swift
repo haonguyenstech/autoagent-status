@@ -290,21 +290,29 @@ func formatTokens(_ n: Int) -> String {
     return "\(n)"
 }
 
-func readTokenUsage() -> TokenUsage {
-    var u = TokenUsage()
+struct DayUsage: Identifiable {
+    let date: Date
+    var billable = 0
+    var costUSD = 0.0
+    var id: Date { date }
+}
+
+/// Single scan of today's + the last `days` days of Claude transcripts. Returns
+/// today's full breakdown plus a per-day billable/cost history (oldest first).
+func readUsageReport(days: Int = 7) -> (today: TokenUsage, history: [DayUsage]) {
+    var today = TokenUsage()
+    var buckets = Array(repeating: (tokens: 0, cost: 0.0), count: days) // index 0 = today
     let fm = FileManager.default
+    let cal = Calendar.current
+    let startToday = cal.startOfDay(for: Date())
 
     var configDirs = ["\(home)/.claude"]
     if let cfg = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"] {
         configDirs.append(cfg)
     }
 
-    let df = DateFormatter()
-    df.dateFormat = "yyyy-MM-dd"
-    let today = df.string(from: Date())
-    // skip files untouched since well before today (26 h, like the CLI)
-    let cutoff = Calendar.current.startOfDay(for: Date()).addingTimeInterval(-26 * 3600)
-
+    // Skip files untouched before the window we care about.
+    let cutoff = startToday.addingTimeInterval(-Double(days) * 86400 - 26 * 3600)
     let isoFrac = ISO8601DateFormatter()
     isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     let iso = ISO8601DateFormatter()
@@ -326,10 +334,13 @@ func readTokenUsage() -> TokenUsage {
                       let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
                       let msg = obj["message"] as? [String: Any],
                       let usage = msg["usage"] as? [String: Any] else { continue }
+                // Which day does this entry belong to? (no timestamp → treat as today)
+                var daysAgo = 0
                 if let ts = obj["timestamp"] as? String {
-                    guard let date = isoFrac.date(from: ts) ?? iso.date(from: ts),
-                          df.string(from: date) == today else { continue }
+                    guard let date = isoFrac.date(from: ts) ?? iso.date(from: ts) else { continue }
+                    daysAgo = cal.dateComponents([.day], from: cal.startOfDay(for: date), to: startToday).day ?? 999
                 }
+                guard daysAgo >= 0 && daysAgo < days else { continue }
                 if let mid = msg["id"] as? String {
                     let key = mid + "\u{0}" + ((obj["requestId"] as? String) ?? "")
                     if seen.contains(key) { continue }
@@ -339,18 +350,57 @@ func readTokenUsage() -> TokenUsage {
                 let out = usage["output_tokens"] as? Int ?? 0
                 let cc = usage["cache_creation_input_tokens"] as? Int ?? 0
                 let cr = usage["cache_read_input_tokens"] as? Int ?? 0
-                u.input += inp; u.output += out; u.cacheCreate += cc; u.cacheRead += cr
+                var cost = 0.0
                 if let model = msg["model"] as? String, let pr = pricing(for: model) {
-                    u.costUSD += Double(inp) * pr.input + Double(out) * pr.output
+                    cost = Double(inp) * pr.input + Double(out) * pr.output
                         + Double(cc) * pr.cacheWrite + Double(cr) * pr.cacheRead
+                }
+                buckets[daysAgo].tokens += inp + out + cc
+                buckets[daysAgo].cost += cost
+                if daysAgo == 0 {
+                    today.input += inp; today.output += out
+                    today.cacheCreate += cc; today.cacheRead += cr
+                    today.costUSD += cost
                 }
             }
         }
     }
-    return u
+    let history = (0..<days).reversed().map { i in
+        DayUsage(date: cal.date(byAdding: .day, value: -i, to: startToday) ?? startToday,
+                 billable: buckets[i].tokens, costUSD: buckets[i].cost)
+    }
+    return (today, history)
 }
 
-func notify(_ title: String, _ body: String) {
+/// Notification categories the user can mute individually (default: on).
+enum NotifKind: String, CaseIterable {
+    case watcher, credential, updates, signIn, keepAwake
+
+    var key: String { "notify_\(rawValue)" }
+    var enabled: Bool { UserDefaults.standard.object(forKey: key) as? Bool ?? true }
+
+    var title: String {
+        switch self {
+        case .watcher: return "Watcher"
+        case .credential: return "Credential & token"
+        case .updates: return "Updates"
+        case .signIn: return "Sign-in prompts"
+        case .keepAwake: return "Keep-awake"
+        }
+    }
+    var icon: String {
+        switch self {
+        case .watcher: return "eye"
+        case .credential: return "key.fill"
+        case .updates: return "arrow.down.circle"
+        case .signIn: return "person.badge.shield.checkmark"
+        case .keepAwake: return "cup.and.saucer"
+        }
+    }
+}
+
+func notify(_ title: String, _ body: String, kind: NotifKind) {
+    guard kind.enabled else { return }
     let content = UNMutableNotificationContent()
     content.title = title
     content.body = body
@@ -520,6 +570,13 @@ final class StatusStore: ObservableObject {
     @Published var updatingCLI = false
     @Published var autoUpdateCLI = UserDefaults.standard.object(forKey: "autoUpdateCLI") as? Bool ?? true
     @Published var usage: TokenUsage?
+    @Published var usageHistory: [DayUsage] = []
+    // Per-category notification mutes (default on).
+    @Published var notifyWatcher = NotifKind.watcher.enabled
+    @Published var notifyCredential = NotifKind.credential.enabled
+    @Published var notifyUpdates = NotifKind.updates.enabled
+    @Published var notifySignIn = NotifKind.signIn.enabled
+    @Published var notifyKeepAwake = NotifKind.keepAwake.enabled
     @Published var appLatestVersion: String?
     @Published var appDownloadURL: String?
     @Published var updatingApp = false
@@ -596,6 +653,27 @@ final class StatusStore: ObservableObject {
         syncSleepGuard()
     }
 
+    func isNotifyOn(_ kind: NotifKind) -> Bool {
+        switch kind {
+        case .watcher: return notifyWatcher
+        case .credential: return notifyCredential
+        case .updates: return notifyUpdates
+        case .signIn: return notifySignIn
+        case .keepAwake: return notifyKeepAwake
+        }
+    }
+
+    func setNotify(_ kind: NotifKind, _ on: Bool) {
+        UserDefaults.standard.set(on, forKey: kind.key)
+        switch kind {
+        case .watcher: notifyWatcher = on
+        case .credential: notifyCredential = on
+        case .updates: notifyUpdates = on
+        case .signIn: notifySignIn = on
+        case .keepAwake: notifyKeepAwake = on
+        }
+    }
+
     /// Remaining keep-awake time as "1h 05m" / "12m", or nil if off/indefinite.
     var keepAwakeRemaining: String? {
         guard let until = keepAwakeUntil else { return nil }
@@ -652,7 +730,7 @@ final class StatusStore: ObservableObject {
             UserDefaults.standard.set(false, forKey: "keepAwake")
             UserDefaults.standard.removeObject(forKey: "keepAwakeUntil")
             self.syncSleepGuard()
-            notify("Sleep re-enabled", "Keep-awake finished — your Mac can sleep normally again.")
+            notify("Sleep re-enabled", "Keep-awake finished — your Mac can sleep normally again.", kind: .keepAwake)
         }
         keepAwakeTimer = item
         DispatchQueue.main.asyncAfter(deadline: .now() + max(1, date.timeIntervalSinceNow), execute: item)
@@ -676,8 +754,11 @@ final class StatusStore: ObservableObject {
         guard force || Date().timeIntervalSince(lastUsageScan) > 300 else { return }
         lastUsageScan = Date()
         usageQueue.async {
-            let u = readTokenUsage()
-            DispatchQueue.main.async { self.usage = u }
+            let report = readUsageReport(days: 7)
+            DispatchQueue.main.async {
+                self.usage = report.today
+                self.usageHistory = report.history
+            }
         }
     }
 
@@ -711,15 +792,16 @@ final class StatusStore: ObservableObject {
                     self.appDownloadURL = appRelease.zipURL
                     if isNewer(appRelease.version, than: appVersion) {
                         notify("App update available",
-                               "AutoAgent Status v\(appRelease.version) is available — click Update App in the panel.")
+                               "AutoAgent Status v\(appRelease.version) is available — click Update App in the panel.",
+                               kind: .updates)
                     }
                 }
                 if let latest, let installed, isNewer(latest, than: installed) {
                     if self.autoUpdateCLI, !self.updatingCLI {
-                        notify("CLI update", "Auto-updating auto-agent-ai v\(installed) → v\(latest)…")
+                        notify("CLI update", "Auto-updating auto-agent-ai v\(installed) → v\(latest)…", kind: .updates)
                         self.updateCLI()
                     } else {
-                        notify("CLI update available", "auto-agent-ai v\(latest) is available (you have v\(installed)).")
+                        notify("CLI update available", "auto-agent-ai v\(latest) is available (you have v\(installed)).", kind: .updates)
                     }
                 }
             }
@@ -742,7 +824,7 @@ final class StatusStore: ObservableObject {
                     self.lastError = "CLI update failed:\n" + String(stripANSI(r.output).suffix(400))
                 } else {
                     self.cliUpdateRequired = false
-                    notify("CLI updated", "auto-agent-ai was updated successfully.")
+                    notify("CLI updated", "auto-agent-ai was updated successfully.", kind: .updates)
                     completion?()
                 }
                 self.checkVersions(force: true)
@@ -776,23 +858,23 @@ final class StatusStore: ObservableObject {
         guard let warn = crossed.min(), !firedExpiryWarnings.contains(warn) else { return }
         firedExpiryWarnings.formUnion(crossed)
         let tail = s.watcherRunning ? " The watcher will try to renew it." : ""
-        notify("Token expiring soon", "Your Claude Code token expires in about \(warn) min.\(tail)")
+        notify("Token expiring soon", "Your Claude Code token expires in about \(warn) min.\(tail)", kind: .credential)
     }
 
     private func notifyTransitions(old: AgentStatus, new: AgentStatus) {
         // Don't notify about changes the user just caused (login/logout clicks).
         let userJustActed = Date().timeIntervalSince(lastUserAction) < 20
         if old.watcherRunning && !new.watcherRunning && !userJustActed {
-            notify("Watcher stopped", "The auto-agent watcher is no longer running.")
+            notify("Watcher stopped", "The auto-agent watcher is no longer running.", kind: .watcher)
         }
         if old.credentialPresent && !new.credentialPresent && !userJustActed {
-            notify("Credential removed", "The Claude Code credential was wiped from your Keychain.")
+            notify("Credential removed", "The Claude Code credential was wiped from your Keychain.", kind: .credential)
         }
         if old.credentialValid && !new.credentialValid && new.credentialPresent && !new.watcherRunning {
-            notify("Token expired", "The token expired and no watcher is running to renew it.")
+            notify("Token expired", "The token expired and no watcher is running to renew it.", kind: .credential)
         }
         if old.state != .active && new.state == .active {
-            notify("AutoAgent active", "Credential synced and watcher running.")
+            notify("AutoAgent active", "Credential synced and watcher running.", kind: .credential)
         }
     }
 
@@ -846,14 +928,16 @@ final class StatusStore: ObservableObject {
                     abortedForAuth = true
                     DispatchQueue.main.async {
                         notify("Sign-in required",
-                               "The watcher needs you to sign in again — open AutoAgent and click Owner or Client Login.")
+                               "The watcher needs you to sign in again — open AutoAgent and click Owner or Client Login.",
+                               kind: .signIn)
                     }
                     return true // abort the hung process
                 }
                 DispatchQueue.main.async {
                     self.loginURL = url
                     notify("Finish signing in",
-                           "Complete the Microsoft sign-in in your browser to finish logging in.")
+                           "Complete the Microsoft sign-in in your browser to finish logging in.",
+                           kind: .signIn)
                 }
                 return false // keep waiting for the browser callback
             }
@@ -870,7 +954,8 @@ final class StatusStore: ObservableObject {
                         // Auto-update once, then retry the original command.
                         if self.autoUpdateCLI, !isRetry, !self.updatingCLI {
                             notify("CLI update required",
-                                   "auto-agent-ai must be updated before it can run — updating now…")
+                                   "auto-agent-ai must be updated before it can run — updating now…",
+                                   kind: .updates)
                             self.updateCLI {
                                 self.runCLI(name, args, isAutoRestart: isAutoRestart,
                                             isRetry: true, interactive: interactive)
@@ -886,7 +971,7 @@ final class StatusStore: ObservableObject {
                 } else {
                     self.cliUpdateRequired = false
                     if isAutoRestart {
-                        notify("Watcher restarted", "Watcher was down — logged in again automatically.")
+                        notify("Watcher restarted", "Watcher was down — logged in again automatically.", kind: .watcher)
                     }
                 }
                 // login spawns a detached watcher that writes state shortly after
@@ -925,7 +1010,7 @@ final class StatusStore: ObservableObject {
                     self.lastError = "App update failed:\n" + String(stripANSI(r.output).suffix(400))
                     return
                 }
-                notify("App updated", "Restarting AutoAgent Status…")
+                notify("App updated", "Restarting AutoAgent Status…", kind: .updates)
                 let relauncher = Process()
                 relauncher.executableURL = URL(fileURLWithPath: "/bin/bash")
                 relauncher.arguments = ["-c", "sleep 1; /usr/bin/open '\(installedAppPath)'"]
@@ -1044,6 +1129,7 @@ struct ContentView: View {
     @ObservedObject var store: StatusStore
     @State private var confirmLogout = false
     @State private var tab: Tab = .status
+    @State private var notifExpanded = false
 
     enum Tab: Hashable { case status, settings }
 
@@ -1136,8 +1222,54 @@ struct ContentView: View {
                 title: "Start at Login",
                 subtitle: "Launch automatically on sign-in",
                 isOn: Binding(get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
+            notificationsSection
         }
         .padding(12)
+    }
+
+    private var notificationsSection: some View {
+        DisclosureGroup(isExpanded: $notifExpanded) {
+            VStack(spacing: 2) {
+                ForEach(NotifKind.allCases, id: \.self) { kind in
+                    notifRow(kind)
+                }
+            }
+            .padding(.top, 6)
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "bell.badge.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.pink)
+                    .frame(width: 26, height: 26)
+                    .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.pink.opacity(0.16)))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Notifications").font(.callout.weight(.medium))
+                    Text("Choose which alerts to show").font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .tint(.secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+    }
+
+    private func notifRow(_ kind: NotifKind) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: kind.icon)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+            Text(kind.title).font(.callout)
+            Spacer(minLength: 8)
+            Toggle("", isOn: Binding(get: { store.isNotifyOn(kind) },
+                                     set: { store.setNotify(kind, $0) }))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .tint(.pink)
+        }
+        .padding(.leading, 4)
+        .padding(.vertical, 1)
     }
 
     /// Global controls, pinned below both tabs.
@@ -1288,6 +1420,9 @@ struct ContentView: View {
                     usageCell("Cache create", u.cacheCreate, icon: "plus.square.on.square", color: .purple)
                     usageCell("Cache read", u.cacheRead, icon: "bolt.fill", color: .orange)
                 }
+                if store.usageHistory.contains(where: { $0.costUSD > 0 }) {
+                    sevenDayChart
+                }
             } else {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.mini)
@@ -1297,6 +1432,23 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    private var sevenDayChart: some View {
+        let week = store.usageHistory
+        let weekCost = week.reduce(0) { $0 + $1.costUSD }
+        return VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text("Last 7 days")
+                    .font(.caption2).foregroundStyle(.secondary)
+                Spacer()
+                Text(formatUSD(weekCost))
+                    .font(.caption.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(.green)
+            }
+            UsageBars(data: week, tint: .green)
+        }
+        .padding(.top, 2)
     }
 
     private var appVersionInfo: (text: String, color: Color) {
@@ -1553,6 +1705,31 @@ struct KeepAwakeRow: View {
         }
         .buttonStyle(.plain)
         .help(label == "∞" ? "Stay awake until turned off" : "Stay awake for \(label)")
+    }
+}
+
+/// A compact 7-bar daily cost chart; the last bar (today) is highlighted.
+struct UsageBars: View {
+    let data: [DayUsage]
+    var tint: Color
+
+    private static let dayFmt: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "EEE"; return f
+    }()
+
+    var body: some View {
+        let maxV = max(data.map(\.costUSD).max() ?? 0, 0.0001)
+        HStack(alignment: .bottom, spacing: 4) {
+            ForEach(Array(data.enumerated()), id: \.offset) { i, d in
+                let isToday = i == data.count - 1
+                RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+                    .fill(tint.opacity(isToday ? 1.0 : 0.4))
+                    .frame(height: max(3, CGFloat(d.costUSD / maxV) * 34))
+                    .frame(maxWidth: .infinity)
+                    .help("\(Self.dayFmt.string(from: d.date)): \(formatUSD(d.costUSD))")
+            }
+        }
+        .frame(height: 34)
     }
 }
 
